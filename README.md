@@ -4,9 +4,9 @@
 
 * `pytest` for tests: `make test`
 * `ruff` for linting/formatting: `make lint` (replaces both `black` and `isort`)
-* [pyproject-pipenv](https://github.com/fopina/pyproject-pipenv) to make sure dependencies in pyproject.toml and Pipfile are in sync
+* `uv` for dependency and virtualenv management (`uv sync --group dev`)
 * `.github` with actions ready to be used
-    * [test](.github/workflows/test.yml) runs lint checks, unit tests and pyproject-pipenv
+    * [test](.github/workflows/test.yml) runs lint checks and unit tests
     * [publish-dev](.github/workflows/publish-dev.yml) publishes feature branches (`dev`/`dev-*`) to:
       * [testpypi](https://test.pypi.org) - more about this on [Notes](#feature-branch-publishing)
       * docker image to ghcr.io - remove job if image makes no sense
@@ -19,10 +19,10 @@
 * [ ] Replace folder `example` with the actual package
 * [ ] Replace `LICENSE` if MIT does not apply
 * [ ] Search the project for `# TODO` to find the (minimum list of) places that need to be changed.
-* [ ] Add PYPI credentials to secrets
-    * `PYPI_USERNAME` and `PYPI_TOKEN` to publish tags to pypi
-    * `TESTPYPI_USERNAME` and `TESTPYPI_TOKEN` to publish dev branches to testpypi
-* [ ] Add [codecov](https://app.codecov.io/github/fopina/) token
+* [ ] Add PYPI tokens to secrets
+    * `PYPI_TOKEN` to publish tags to pypi
+    * `TESTPYPI_TOKEN` to publish dev branches to testpypi
+* [ ] Add [codecov](https://app.codecov.io/github/fopina/) token or enable global tokenless uploads in your profile
     * `CODECOV_TOKEN` taken from link above
 * [ ] Replace this README.md - template below
 

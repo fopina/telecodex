@@ -18,8 +18,8 @@ jobs:
       version: '${{ github.run_number }}.0.0'
       repository: testpypi
     secrets:
-      twine_username: ${{ secrets.TESTPYPI_USERNAME }}
-      twine_password: ${{ secrets.TESTPYPI_TOKEN }}
+      twine_token: ${{ secrets.TESTPYPI_TOKEN }}
+      CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
 
   build_image:
     # TODO: remove this entire job if an image does not make sense (ie: just a library, no CLI)

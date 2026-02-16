@@ -4,18 +4,16 @@ FROM python:3.10-alpine AS base
 # --- builder
 FROM base AS builder
 WORKDIR /app
-WORKDIR /
-
-COPY Pipfile.lock .
-RUN pip install pipenv
-RUN pipenv requirements > requirements.txt
-RUN pip install --target=/app -r requirements.txt
+RUN pip install uv
+# TODO: replace with your package name
+COPY example /src/example
+COPY pyproject.toml README.md /src/
+RUN uv pip install --target=/app /src
 
 # --- main
 FROM base
 COPY --from=builder /app /app
 ENV PYTHONPATH=/app
-# TODO: replace with your package name
-COPY example /app/example
 
+# TODO: replace with your package name
 ENTRYPOINT ["python3", "-m", "example"]

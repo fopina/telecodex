@@ -1,21 +1,19 @@
 lint:
-	ruff format
-	ruff check --fix
-	pyproject-pipenv --fix
+	uv run ruff format
+	uv run ruff check --fix
 
 lint-check:
-	ruff format --diff
-	ruff check
-	pyproject-pipenv
+	uv run ruff format --diff
+	uv run ruff check
 
 test:
 	if [ -n "$(GITHUB_RUN_ID)" ]; then \
-		pytest --cov --cov-report=xml --junitxml=junit.xml -o junit_family=legacy; \
+		uv run pytest --cov --cov-report=xml --junitxml=junit.xml -o junit_family=legacy; \
 	else \
-		python -m pytest --cov; \
+		uv run python -m pytest --cov; \
 	fi
 
 testpub:
 	rm -fr dist
-	pyproject-build
-	twine upload --repository testpypi dist/*
+	uv run pyproject-build
+	uv run twine upload --repository testpypi dist/*

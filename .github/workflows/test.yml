@@ -2,6 +2,9 @@ name: 🧪 tests
 
 on:
   workflow_call:
+    secrets:
+      CODECOV_TOKEN:
+        required: false
   push:
     branches-ignore:
       # these are already tested by publish-dev
@@ -23,9 +26,8 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install pipenv
-          pipenv requirements --dev > reqs.txt
-          pip install -r reqs.txt
+          pip install uv
+          uv sync --group dev
 
       - name: Lint check
         id: lint-check
@@ -39,15 +41,10 @@ jobs:
           make test
       
       - name: Upload results to Codecov
-        uses: codecov/codecov-action@v4
+        uses: codecov/codecov-action@v5
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
-      
-      - name: Upload test results to Codecov
-        if: ${{ !cancelled() }}
-        uses: codecov/test-results-action@v1
-        with:
-          token: ${{ secrets.CODECOV_TOKEN }}
+          report_type: test_results
 
       - name: Final check
         if: ${{ steps.lint-check.outcome == 'failure' }}
