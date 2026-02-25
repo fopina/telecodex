@@ -2,10 +2,6 @@ name: 👷 publish dev
 
 on:
   push:
-    # TODO: choose your "feature branch" naming (or leave it like this)
-    # or run this on every non-main branch, replacing the whole `branches` with
-    # branches-ignore:
-    #   - main
     branches: 
       - dev
       - dev/*
@@ -22,7 +18,6 @@ jobs:
       CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
 
   build_image:
-    # TODO: remove this entire job if an image does not make sense (ie: just a library, no CLI)
     permissions: write-all
     needs: test_and_publish
     name: test image

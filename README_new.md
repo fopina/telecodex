@@ -23,7 +23,7 @@ This bot receives Telegram messages, sends them to `codex app-server` over stdio
 export TELEGRAM_BOT_TOKEN='123456:ABC...'
 export CODEX_APP_SERVER_CMD='codex app-server'
 export CODEX_MODEL='gpt-5'
-python3 bot.py
+python3 -m telecodex
 ```
 
 ## Protocol used

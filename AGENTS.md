@@ -4,7 +4,7 @@ Guidance for agents working in this repository.
 
 ## Project context
 
-- This repository is a Telegram bot bridge for `codex app-server` over stdio (`bot.py`).
+- This repository is a Telegram bot bridge for `codex app-server` over stdio (`telecodex/__main__.py`).
 - The repo still contains Python package template leftovers (`example/`, `tests/test_demo.py`, template metadata in `pyproject.toml`/`README.md`).
 - Prefer changes that improve the Telegram bot behavior without expanding scope into template cleanup unless requested.
 
@@ -16,7 +16,7 @@ Guidance for agents working in this repository.
 - Keep the bot compatible with Python `>=3.10` (see `pyproject.toml`).
 - Prefer Python standard library solutions unless a dependency is already present and justified.
 
-## Bot-specific constraints (`bot.py`)
+## Bot-specific constraints (`telecodex/__main__.py`)
 
 - Maintain Telegram reply safety:
   - Telegram messages are capped at 4096 chars; keep truncation behavior or improve it safely.
@@ -40,6 +40,6 @@ Guidance for agents working in this repository.
 
 ## Docs and config hygiene
 
-- Keep `README_new.md` and `bot.py` in sync when changing runtime env vars or execution flow.
+- Keep `README_new.md` and `telecodex/__main__.py` in sync when changing runtime env vars or execution flow.
 - If modifying packaging metadata (`pyproject.toml`), note whether changes are for the bot project or template cleanup.
 - Avoid deleting template files unless the task asks for repository cleanup/migration.
