@@ -26,7 +26,7 @@ Homepage = "https://github.com/fopina/telecodex"
 Repository = "https://github.com/fopina/telecodex"
 
 [project.scripts]
-telecodex-bot = "telecodex.__main__:main"
+telecodex = "telecodex.__main__:main"
 
 [tool.setuptools.packages.find]
 include = ["telecodex*"]
