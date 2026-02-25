@@ -68,7 +68,7 @@ jobs:
       - name: highlight
         run: |
           INDEX=""
-          if [ "${{ inputs.repository }}" != "pypi" ]; then
+          if [ "${{ inputs.repository }}" = "testpypi" ]; then
             INDEX=" --index-url https://test.pypi.org/simple/"
           fi
           cat <<EOF >> ${GITHUB_STEP_SUMMARY}
