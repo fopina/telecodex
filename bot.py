@@ -1,14 +1,20 @@
 #!/usr/bin/env python3
+from __future__ import annotations
+
 import json
+import asyncio
 import os
 import shlex
 import subprocess
 import sys
 import threading
 import time
-import urllib.request
+from contextlib import suppress
 
 from dotenv import load_dotenv
+from telegram import Update
+from telegram.constants import ChatAction
+from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters
 
 load_dotenv()
 
@@ -175,6 +181,21 @@ class CodexStdioClient:
                 return fallback_final
             return "No text response returned by app-server."
 
+    def stop(self) -> None:
+        if self.proc is None:
+            return
+        if self.proc.poll() is not None:
+            return
+
+        self.proc.terminate()
+        with suppress(subprocess.TimeoutExpired):
+            self.proc.wait(timeout=5)
+
+        if self.proc.poll() is None:
+            self.proc.kill()
+            with suppress(subprocess.TimeoutExpired):
+                self.proc.wait(timeout=5)
+
 
 def require_env() -> None:
     if not TELEGRAM_BOT_TOKEN:
@@ -182,81 +203,58 @@ def require_env() -> None:
         sys.exit(1)
 
 
-def telegram_api_url(method: str) -> str:
-    return f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}"
-
-
-def post_json(url: str, payload: dict, timeout: int = 60) -> dict:
-    body = json.dumps(payload).encode("utf-8")
-    request = urllib.request.Request(
-        url,
-        data=body,
-        headers={"Content-Type": "application/json", "Accept": "application/json"},
-        method="POST",
-    )
-    with urllib.request.urlopen(request, timeout=timeout) as resp:
-        raw = resp.read().decode("utf-8")
-        return json.loads(raw)
-
-
-def get_updates(offset: int | None = None) -> list[dict]:
-    payload = {"timeout": POLL_TIMEOUT_SECONDS, "allowed_updates": ["message"]}
-    if offset is not None:
-        payload["offset"] = offset
-    response = post_json(telegram_api_url("getUpdates"), payload, timeout=POLL_TIMEOUT_SECONDS + 10)
-    if not response.get("ok"):
-        raise RuntimeError(f"Telegram getUpdates failed: {response}")
-    return response.get("result", [])
-
-
-def send_message(chat_id: int, text: str, reply_to_message_id: int | None = None) -> None:
-    payload = {"chat_id": chat_id, "text": text}
-    if reply_to_message_id is not None:
-        payload["reply_parameters"] = {"message_id": reply_to_message_id}
-    response = post_json(telegram_api_url("sendMessage"), payload)
-    if not response.get("ok"):
-        raise RuntimeError(f"Telegram sendMessage failed: {response}")
-
-
-def handle_message(update: dict, codex: CodexStdioClient) -> None:
-    message = update.get("message", {})
-    text = (message.get("text") or "").strip()
-    chat = message.get("chat", {})
-    chat_id = chat.get("id")
-    msg_id = message.get("message_id")
-
-    if not chat_id or not text:
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    if message is None:
+        return
+    text = (message.text or '').strip()
+    if not text:
         return
 
+    codex = context.application.bot_data['codex']
+    assert isinstance(codex, CodexStdioClient)
+
+    await context.bot.send_chat_action(chat_id=message.chat_id, action=ChatAction.TYPING)
+
     try:
-        reply = codex.ask(text)
+        reply = await asyncio.to_thread(codex.ask, text)
     except Exception as exc:  # noqa: BLE001
         reply = f"app-server error: {exc}"
 
-    send_message(chat_id, reply[:4096], reply_to_message_id=msg_id)
+    await message.reply_text(reply[:4096], reply_to_message_id=message.message_id)
+
+
+async def handle_error(_: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    print(f"Loop error: {context.error}", file=sys.stderr)
 
 
 def main() -> None:
     require_env()
 
     codex = CodexStdioClient(CODEX_APP_SERVER_CMD)
-    codex.start()
-
-    print("Bot is running (Telegram <-> codex app-server over stdio).")
-    next_offset = None
-
     while True:
         try:
-            updates = get_updates(next_offset)
-            for update in updates:
-                next_offset = update["update_id"] + 1
-                handle_message(update, codex)
+            codex.start()
+            app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+            app.bot_data['codex'] = codex
+            app.add_handler(MessageHandler(filters.TEXT, handle_message))
+            app.add_error_handler(handle_error)
+
+            print("Bot is running (Telegram <-> codex app-server over stdio).")
+            app.run_polling(
+                allowed_updates=['message'],
+                timeout=POLL_TIMEOUT_SECONDS,
+                close_loop=False,
+            )
+            return
         except KeyboardInterrupt:
             print("Stopped by user")
             return
         except Exception as exc:  # noqa: BLE001
             print(f"Loop error: {exc}", file=sys.stderr)
             time.sleep(3)
+        finally:
+            codex.stop()
 
 
 if __name__ == "__main__":
