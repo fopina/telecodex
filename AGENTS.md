@@ -31,11 +31,12 @@ Guidance for agents working in this repository.
 ## Validation
 
 - Use `uv` for local commands.
+- First-time setup (or after dependency changes): `uv sync --group dev`
 - Run formatting/linting before finishing code changes:
   - `make lint` (auto-format + ruff fixes)
-  - or `make lint-check` for verification-only
+  - `make lint-check` for verification-only (`ruff format --diff` + `ruff check`)
 - Run tests before finishing changes when feasible:
-  - `make test`
+  - `make test` (uses `uv run python -m pytest --cov` locally)
 - If tests are template-only or unrelated, say so explicitly in your summary.
 
 ## Docs and config hygiene
