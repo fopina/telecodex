@@ -13,7 +13,8 @@ from contextlib import suppress
 
 from dotenv import load_dotenv
 from telegram import Update
-from telegram.constants import ChatAction
+from telegram.constants import ChatAction, ParseMode
+from telegram.error import BadRequest
 from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters
 
 load_dotenv()
@@ -221,7 +222,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     except Exception as exc:  # noqa: BLE001
         reply = f'app-server error: {exc}'
 
-    await message.reply_text(reply[:4096], reply_to_message_id=message.message_id)
+    reply = reply[:4096]
+    try:
+        await message.reply_text(
+            reply,
+            reply_to_message_id=message.message_id,
+            parse_mode=ParseMode.MARKDOWN,
+            disable_web_page_preview=True,
+        )
+    except BadRequest:
+        await message.reply_text(
+            reply,
+            reply_to_message_id=message.message_id,
+            disable_web_page_preview=True,
+        )
 
 
 async def handle_error(_: object, context: ContextTypes.DEFAULT_TYPE) -> None:
