@@ -285,7 +285,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     allowed_chat_id = context.application.bot_data.get('allowed_chat_id')
-    if isinstance(allowed_chat_id, int) and message.chat_id != allowed_chat_id:
+    if message.chat_id != allowed_chat_id:
         return
 
     codex = context.application.bot_data['codex']
