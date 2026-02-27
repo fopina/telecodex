@@ -335,7 +335,5 @@ class Telecodex:
 
 def main() -> None:
     Telecodex.click()
-
-
 if __name__ == '__main__':
     main()
