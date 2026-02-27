@@ -36,6 +36,7 @@ Example:
 [telecodex]
 telegram_bot_token = "123456:ABC..."
 allowed_chat_id = 123456789
+acp_log_file = "~/.local/state/telecodex/acp-messages.log"
 codex_app_server_cmd = "codex app-server"
 codex_model = "gpt-5"
 codex_cwd = "."
@@ -52,11 +53,12 @@ python3 -m telecodex --config /path/to/config.toml
 Option precedence is:
 
 1. CLI flags
-2. Environment variables (`TELEGRAM_BOT_TOKEN`, `TELEGRAM_ALLOWED_CHAT_ID`, `CODEX_*`, `POLL_TIMEOUT_SECONDS`)
+2. Environment variables (`TELEGRAM_BOT_TOKEN`, `TELEGRAM_ALLOWED_CHAT_ID`, `TELECODEX_ACP_LOG_FILE`, `CODEX_*`, `POLL_TIMEOUT_SECONDS`)
 3. TOML config values
 4. Built-in defaults
 
 `allowed_chat_id` (or `TELEGRAM_ALLOWED_CHAT_ID`) is mandatory, and the bot only replies to that chat id.
+All ACP/app-server messages received on stdout are appended to `acp_log_file`, including messages that are not processed or forwarded to Telegram.
 
 ## Run
 

@@ -16,7 +16,7 @@ from typing import Any
 
 import classyclick
 import click
-from platformdirs import user_config_dir
+from platformdirs import user_config_dir, user_log_dir
 from telegram import Update
 from telegram.constants import ChatAction, ParseMode
 from telegram.error import BadRequest
@@ -32,6 +32,7 @@ except ModuleNotFoundError:  # pragma: no cover - Python 3.10 fallback
 class Settings:
     telegram_bot_token: str
     allowed_chat_id: int | None
+    acp_log_file: str
     poll_timeout_seconds: int
     codex_app_server_cmd: str
     codex_model: str
@@ -40,10 +41,12 @@ class Settings:
 
 
 DEFAULT_CONFIG_PATH = str(Path(user_config_dir('telecodex')) / 'config.toml')
+DEFAULT_ACP_LOG_PATH = str(Path(user_log_dir('telecodex')) / 'acp-messages.log')
 CONFIG_SECTION = 'telecodex'
 CONFIG_KEYS = {
     'telegram_bot_token',
     'allowed_chat_id',
+    'acp_log_file',
     'poll_timeout_seconds',
     'codex_app_server_cmd',
     'codex_model',
@@ -92,14 +95,16 @@ def config_callback(ctx: click.Context, _: click.Parameter, value: str) -> str:
 
 
 class CodexStdioClient:
-    def __init__(self, command: str, model: str, cwd: str, approval_policy: str) -> None:
+    def __init__(self, command: str, model: str, cwd: str, approval_policy: str, acp_log_file: str) -> None:
         self.command = command
         self.model = model
         self.cwd = cwd
         self.approval_policy = approval_policy
+        self.acp_log_file = Path(acp_log_file).expanduser()
         self.proc: subprocess.Popen[str] | None = None
         self.next_id = 1
         self.lock = threading.Lock()
+        self.acp_log_lock = threading.Lock()
         self.thread_id: str | None = None
 
     def start(self) -> None:
@@ -115,6 +120,7 @@ class CodexStdioClient:
             text=True,
             bufsize=1,
         )
+        self._ensure_log_file()
 
         self._request(
             'initialize',
@@ -159,6 +165,16 @@ class CodexStdioClient:
         self.proc.stdin.write(line + '\n')
         self.proc.stdin.flush()
 
+    def _ensure_log_file(self) -> None:
+        self.acp_log_file.parent.mkdir(parents=True, exist_ok=True)
+        with self.acp_log_file.open('a', encoding='utf-8'):
+            pass
+
+    def _log_acp_message(self, line: str) -> None:
+        with self.acp_log_lock:
+            with self.acp_log_file.open('a', encoding='utf-8') as fh:
+                fh.write(line + '\n')
+
     def _read_message(self) -> dict:
         self._ensure_running()
         assert self.proc is not None and self.proc.stdout is not None
@@ -171,6 +187,7 @@ class CodexStdioClient:
             line = line.strip()
             if not line:
                 continue
+            self._log_acp_message(line)
             try:
                 msg = json.loads(line)
             except json.JSONDecodeError:
@@ -326,6 +343,7 @@ def run_bot(settings: Settings) -> None:
         settings.codex_model,
         settings.codex_cwd,
         settings.codex_approval_policy,
+        settings.acp_log_file,
     )
     while True:
         try:
@@ -381,6 +399,13 @@ class Telecodex:
         show_envvar=True,
         help='Only this Telegram chat id will receive replies.',
     )
+    acp_log_file: str = classyclick.Option(
+        envvar='TELECODEX_ACP_LOG_FILE',
+        default=DEFAULT_ACP_LOG_PATH,
+        type=str,
+        show_envvar=True,
+        help='File path to append every ACP/app-server message received.',
+    )
     poll_timeout_seconds: int = classyclick.Option(
         envvar='POLL_TIMEOUT_SECONDS',
         default=30,
@@ -421,6 +446,7 @@ class Telecodex:
         settings = Settings(
             telegram_bot_token=self.telegram_bot_token,
             allowed_chat_id=self.allowed_chat_id,
+            acp_log_file=self.acp_log_file,
             poll_timeout_seconds=self.poll_timeout_seconds,
             codex_app_server_cmd=self.codex_app_server_cmd,
             codex_model=self.codex_model,
