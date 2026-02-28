@@ -15,6 +15,7 @@ Guidance for agents working in this repository.
 - Do not log or print secrets (especially `TELEGRAM_BOT_TOKEN`).
 - Keep the bot compatible with Python `>=3.10` (see `pyproject.toml`).
 - Prefer Python standard library solutions unless a dependency is already present and justified.
+- Use `unittest.TestCase` style for tests.
 
 ## Bot-specific constraints (`telecodex/__main__.py`)
 
