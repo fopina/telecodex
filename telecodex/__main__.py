@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import html
 import json
 import os
 import shlex
@@ -378,6 +379,11 @@ def format_raw_json_markdown(raw_message: str) -> str:
     return f'```json\n{safe_raw}\n```'
 
 
+def format_raw_json_expandable_blockquote(raw_message: str) -> str:
+    escaped = html.escape(raw_message)
+    return f'<blockquote expandable>{escaped}</blockquote>'
+
+
 def is_delta_message(raw_message: str) -> bool:
     try:
         msg = json.loads(raw_message)
@@ -407,7 +413,13 @@ def should_report_verbose_unhandled_message(msg: dict) -> bool:
         return True
     if 'delta' in method.lower():
         return False
-    if method in {'item/agentMessage/delta', 'turn/completed', 'codex/event/token_count'}:
+    if method in {
+        'item/agentMessage/delta',
+        'turn/completed',
+        'account/rateLimits/updated',
+        'codex/event/token_count',
+        'thread/tokenUsage/updated',
+    }:
         return False
     return True
 
@@ -426,6 +438,24 @@ async def reply_markdown(message: Any, text: str, reply_to_message_id: int) -> N
             text,
             reply_to_message_id=reply_to_message_id,
             disable_web_page_preview=True,
+        )
+
+
+async def reply_expandable_blockquote(message: Any, text: str, reply_to_message_id: int) -> None:
+    max_payload = 4000
+    payload = text[:max_payload]
+    try:
+        await message.reply_text(
+            format_raw_json_expandable_blockquote(payload),
+            reply_to_message_id=reply_to_message_id,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+    except BadRequest:
+        await reply_markdown(
+            message,
+            format_raw_json_markdown(payload),
+            reply_to_message_id=reply_to_message_id,
         )
 
 
@@ -448,7 +478,7 @@ async def process_user_input(message: Any, context: ContextTypes.DEFAULT_TYPE, t
         for raw_message in ask_result.unprocessed_messages:
             if is_delta_message(raw_message):
                 continue
-            await reply_markdown(message, format_raw_json_markdown(raw_message), reply_to_message_id=message.message_id)
+            await reply_expandable_blockquote(message, raw_message, reply_to_message_id=message.message_id)
 
 
 async def handle_start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
