@@ -62,6 +62,7 @@ CONFIG_KEYS = {
     'codex_approval_policy',
 }
 
+
 def load_settings_from_toml(config_path: str) -> dict[str, Any]:
     path = Path(config_path).expanduser()
     if not path.exists():
