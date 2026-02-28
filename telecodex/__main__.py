@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import os
 import shlex
@@ -11,16 +12,17 @@ import threading
 import time
 from contextlib import suppress
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import classyclick
 import click
-from platformdirs import user_config_dir, user_log_dir
-from telegram import Update
+from platformdirs import user_config_dir
+from telegram import BotCommand, Update
 from telegram.constants import ChatAction, ParseMode
 from telegram.error import BadRequest
-from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
 
 try:
     import tomllib
@@ -32,7 +34,7 @@ except ModuleNotFoundError:  # pragma: no cover - Python 3.10 fallback
 class Settings:
     telegram_bot_token: str
     allowed_chat_id: int | None
-    acp_log_file: str
+    acp_log_file: str | None
     poll_timeout_seconds: int
     codex_app_server_cmd: str
     codex_model: str
@@ -40,8 +42,13 @@ class Settings:
     codex_approval_policy: str
 
 
+@dataclass(slots=True)
+class AskResult:
+    reply: str
+    unprocessed_messages: list[str]
+
+
 DEFAULT_CONFIG_PATH = str(Path(user_config_dir('telecodex')) / 'config.toml')
-DEFAULT_ACP_LOG_PATH = str(Path(user_log_dir('telecodex')) / 'acp-messages.log')
 CONFIG_SECTION = 'telecodex'
 CONFIG_KEYS = {
     'telegram_bot_token',
@@ -53,6 +60,14 @@ CONFIG_KEYS = {
     'codex_cwd',
     'codex_approval_policy',
 }
+
+KNOWN_ACP_METHOD_PREFIXES = (
+    'codex/event/',
+    'item/',
+    'turn/',
+    'thread/',
+    'account/',
+)
 
 
 def load_settings_from_toml(config_path: str) -> dict[str, Any]:
@@ -95,16 +110,18 @@ def config_callback(ctx: click.Context, _: click.Parameter, value: str) -> str:
 
 
 class CodexStdioClient:
-    def __init__(self, command: str, model: str, cwd: str, approval_policy: str, acp_log_file: str) -> None:
+    def __init__(self, command: str, model: str, cwd: str, approval_policy: str, acp_log_file: str | None) -> None:
         self.command = command
         self.model = model
         self.cwd = cwd
         self.approval_policy = approval_policy
-        self.acp_log_file = Path(acp_log_file).expanduser()
+        self.acp_log_file = Path(acp_log_file).expanduser() if acp_log_file else None
         self.proc: subprocess.Popen[str] | None = None
         self.next_id = 1
         self.lock = threading.Lock()
         self.acp_log_lock = threading.Lock()
+        self.rate_limits_lock = threading.Lock()
+        self.rate_limits_by_id: dict[Any, dict[str, Any]] = {}
         self.thread_id: str | None = None
 
     def start(self) -> None:
@@ -166,16 +183,20 @@ class CodexStdioClient:
         self.proc.stdin.flush()
 
     def _ensure_log_file(self) -> None:
+        if self.acp_log_file is None:
+            return
         self.acp_log_file.parent.mkdir(parents=True, exist_ok=True)
         with self.acp_log_file.open('a', encoding='utf-8'):
             pass
 
     def _log_acp_message(self, line: str) -> None:
+        if self.acp_log_file is None:
+            return
         with self.acp_log_lock:
             with self.acp_log_file.open('a', encoding='utf-8') as fh:
                 fh.write(line + '\n')
 
-    def _read_message(self) -> dict:
+    def _read_message(self) -> tuple[dict, str]:
         self._ensure_running()
         assert self.proc is not None and self.proc.stdout is not None
 
@@ -193,36 +214,59 @@ class CodexStdioClient:
             except json.JSONDecodeError:
                 continue
             if isinstance(msg, dict):
-                return msg
+                self._track_rate_limits(msg)
+                return msg, line
 
-    def _request(self, method: str, params: dict) -> dict:
+    def _track_rate_limits(self, msg: dict[str, Any]) -> None:
+        method = msg.get('method')
+        if method != 'account/rateLimits/updated':
+            return
+        params = msg.get('params')
+        if not isinstance(params, dict):
+            return
+        rate_limits = params.get('rateLimits')
+        if not isinstance(rate_limits, dict):
+            return
+        limit_id = rate_limits.get('limitId')
+        with self.rate_limits_lock:
+            self.rate_limits_by_id[limit_id] = copy.deepcopy(rate_limits)
+
+    def get_rate_limits_snapshot(self) -> dict[Any, dict[str, Any]]:
+        with self.rate_limits_lock:
+            return copy.deepcopy(self.rate_limits_by_id)
+
+    def _request(self, method: str, params: dict, unprocessed_messages: list[str] | None = None) -> dict:
         req_id = self.next_id
         self.next_id += 1
 
         self._send({'id': req_id, 'method': method, 'params': params})
 
         while True:
-            msg = self._read_message()
+            msg, raw_message = self._read_message()
             if msg.get('id') == req_id:
                 if 'error' in msg:
                     raise RuntimeError(f'{method} failed: {msg["error"]}')
                 return msg.get('result', {})
+            if unprocessed_messages is not None and should_report_verbose_unhandled_message(msg):
+                unprocessed_messages.append(raw_message)
 
     def _notify(self, method: str, params: dict) -> None:
         self._send({'method': method, 'params': params})
 
-    def ask(self, text: str) -> str:
+    def ask(self, text: str) -> AskResult:
         with self.lock:
             self._ensure_running()
             if not self.thread_id:
                 raise RuntimeError('No thread initialized')
 
+            unprocessed_messages: list[str] = []
             turn_result = self._request(
                 'turn/start',
                 {
                     'threadId': self.thread_id,
                     'input': [{'type': 'text', 'text': text}],
                 },
+                unprocessed_messages=unprocessed_messages,
             )
             turn = turn_result.get('turn') if isinstance(turn_result, dict) else None
             turn_id = turn.get('id') if isinstance(turn, dict) else None
@@ -233,11 +277,12 @@ class CodexStdioClient:
             fallback_final: str | None = None
 
             while True:
-                msg = self._read_message()
+                msg, raw_message = self._read_message()
 
                 method = msg.get('method')
                 params = msg.get('params')
                 if not method or not isinstance(params, dict):
+                    unprocessed_messages.append(raw_message)
                     continue
 
                 if method == 'item/agentMessage/delta' and params.get('turnId') == turn_id:
@@ -250,6 +295,8 @@ class CodexStdioClient:
                     completed_turn = params.get('turn')
                     completed_turn_id = completed_turn.get('id') if isinstance(completed_turn, dict) else None
                     if completed_turn_id != turn_id:
+                        if should_report_verbose_unhandled_message(msg):
+                            unprocessed_messages.append(raw_message)
                         continue
 
                     agent_state = completed_turn.get('agentState') if isinstance(completed_turn, dict) else None
@@ -257,13 +304,17 @@ class CodexStdioClient:
                     if isinstance(message, str) and message.strip():
                         fallback_final = message
                     break
+                if should_report_verbose_unhandled_message(msg):
+                    unprocessed_messages.append(raw_message)
 
             final = ''.join(chunks).strip()
             if final:
-                return final
+                return AskResult(reply=final, unprocessed_messages=unprocessed_messages)
             if fallback_final:
-                return fallback_final
-            return 'No text response returned by app-server.'
+                return AskResult(reply=fallback_final, unprocessed_messages=unprocessed_messages)
+            return AskResult(
+                reply='No text response returned by app-server.', unprocessed_messages=unprocessed_messages
+            )
 
     def stop(self) -> None:
         if self.proc is None:
@@ -305,30 +356,167 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if message.chat_id != allowed_chat_id:
         return
 
+    await process_user_input(message, context, text)
+
+
+def format_raw_json_markdown(raw_message: str) -> str:
+    safe_raw = raw_message.replace('```', '``\\`')
+    return f'```json\n{safe_raw}\n```'
+
+
+def is_delta_message(raw_message: str) -> bool:
+    try:
+        msg = json.loads(raw_message)
+    except json.JSONDecodeError:
+        return False
+    if not isinstance(msg, dict):
+        return False
+
+    method = msg.get('method')
+    if isinstance(method, str) and 'delta' in method.lower():
+        return True
+
+    params = msg.get('params')
+    if isinstance(params, dict):
+        nested_msg = params.get('msg')
+        if isinstance(nested_msg, dict):
+            msg_type = nested_msg.get('type')
+            if isinstance(msg_type, str) and 'delta' in msg_type.lower():
+                return True
+
+    return False
+
+
+def should_report_verbose_unhandled_message(msg: dict) -> bool:
+    method = msg.get('method')
+    if not isinstance(method, str):
+        return True
+    if 'delta' in method.lower():
+        return False
+    if method in {'item/agentMessage/delta', 'turn/completed'}:
+        return False
+    if method.startswith(KNOWN_ACP_METHOD_PREFIXES):
+        return False
+    return True
+
+
+async def reply_markdown(message: Any, text: str, reply_to_message_id: int) -> None:
+    text = text[:4096]
+    try:
+        await message.reply_text(
+            text,
+            reply_to_message_id=reply_to_message_id,
+            parse_mode=ParseMode.MARKDOWN,
+            disable_web_page_preview=True,
+        )
+    except BadRequest:
+        await message.reply_text(
+            text,
+            reply_to_message_id=reply_to_message_id,
+            disable_web_page_preview=True,
+        )
+
+
+async def process_user_input(message: Any, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
     codex = context.application.bot_data['codex']
     assert isinstance(codex, CodexStdioClient)
 
     await context.bot.send_chat_action(chat_id=message.chat_id, action=ChatAction.TYPING)
 
     try:
-        reply = await asyncio.to_thread(codex.ask, text)
+        ask_result = await asyncio.to_thread(codex.ask, text)
+        assert isinstance(ask_result, AskResult)
     except Exception as exc:  # noqa: BLE001
-        reply = f'app-server error: {exc}'
+        await reply_markdown(message, f'app-server error: {exc}', reply_to_message_id=message.message_id)
+        return
 
-    reply = reply[:4096]
-    try:
-        await message.reply_text(
-            reply,
-            reply_to_message_id=message.message_id,
-            parse_mode=ParseMode.MARKDOWN,
-            disable_web_page_preview=True,
-        )
-    except BadRequest:
-        await message.reply_text(
-            reply,
-            reply_to_message_id=message.message_id,
-            disable_web_page_preview=True,
-        )
+    await reply_markdown(message, ask_result.reply, reply_to_message_id=message.message_id)
+
+    if context.application.bot_data.get('verbose'):
+        for raw_message in ask_result.unprocessed_messages:
+            if is_delta_message(raw_message):
+                continue
+            await reply_markdown(message, format_raw_json_markdown(raw_message), reply_to_message_id=message.message_id)
+
+
+async def handle_start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    if message is None:
+        return
+    allowed_chat_id = context.application.bot_data.get('allowed_chat_id')
+    if message.chat_id != allowed_chat_id:
+        return
+    await process_user_input(message, context, 'hello')
+
+
+async def handle_verbose_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    if message is None:
+        return
+    allowed_chat_id = context.application.bot_data.get('allowed_chat_id')
+    if message.chat_id != allowed_chat_id:
+        return
+    verbose = bool(context.application.bot_data.get('verbose'))
+    verbose = not verbose
+    context.application.bot_data['verbose'] = verbose
+    status = 'ON' if verbose else 'OFF'
+    await reply_markdown(message, f'Verbose mode is now `{status}`.', reply_to_message_id=message.message_id)
+
+
+async def handle_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    if message is None:
+        return
+    allowed_chat_id = context.application.bot_data.get('allowed_chat_id')
+    if message.chat_id != allowed_chat_id:
+        return
+
+    codex = context.application.bot_data['codex']
+    assert isinstance(codex, CodexStdioClient)
+    snapshot = await asyncio.to_thread(codex.get_rate_limits_snapshot)
+    if not snapshot:
+        await reply_markdown(message, 'No rate limits received yet.', reply_to_message_id=message.message_id)
+        return
+
+    lines: list[str] = ['*Rate Limits*']
+    for limit_id, values in sorted(snapshot.items(), key=lambda item: str(item[0])):
+        model = 'Global' if limit_id is None else str(limit_id)
+        lines.append('')
+        lines.append(f'*Model:* `{model}`')
+
+        primary = values.get('primary')
+        secondary = values.get('secondary')
+        lines.append(f'*Primary:* {format_rate_limit_bucket(primary)}')
+        lines.append(f'*Secondary:* {format_rate_limit_bucket(secondary)}')
+
+    await reply_markdown(message, '\n'.join(lines), reply_to_message_id=message.message_id)
+
+
+def format_rate_limit_bucket(bucket: Any) -> str:
+    if not isinstance(bucket, dict):
+        return 'n/a'
+    used_percent = bucket.get('usedPercent')
+    resets_at = bucket.get('resetsAt')
+    used_percent_display = f'{used_percent}%' if isinstance(used_percent, (int, float)) else 'n/a'
+    reset_display = format_utc_timestamp(resets_at)
+    return f'{used_percent_display} - {reset_display}'
+
+
+def format_utc_timestamp(value: Any) -> str:
+    if not isinstance(value, (int, float)):
+        return 'n/a'
+    dt = datetime.fromtimestamp(value, tz=timezone.utc)
+    return dt.strftime('%Y-%m-%d %H:%M:%S UTC')
+
+
+async def setup_bot_commands(application: Any) -> None:
+    await application.bot.set_my_commands(
+        [
+            BotCommand(command='start', description='Start conversation with Codex'),
+            BotCommand(command='verbose', description='Toggle verbose ACP debug messages'),
+            BotCommand(command='status', description='Show latest ACP rate-limit updates'),
+        ]
+    )
 
 
 async def handle_error(_: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -348,10 +536,14 @@ def run_bot(settings: Settings) -> None:
     while True:
         try:
             codex.start()
-            app = ApplicationBuilder().token(settings.telegram_bot_token).build()
+            app = ApplicationBuilder().token(settings.telegram_bot_token).post_init(setup_bot_commands).build()
             app.bot_data['codex'] = codex
             app.bot_data['allowed_chat_id'] = settings.allowed_chat_id
-            app.add_handler(MessageHandler(filters.TEXT, handle_message))
+            app.bot_data['verbose'] = False
+            app.add_handler(CommandHandler('start', handle_start_command))
+            app.add_handler(CommandHandler('verbose', handle_verbose_command))
+            app.add_handler(CommandHandler('status', handle_status_command))
+            app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
             app.add_error_handler(handle_error)
 
             print('Bot is running (Telegram <-> codex app-server over stdio).')
@@ -399,12 +591,12 @@ class Telecodex:
         show_envvar=True,
         help='Only this Telegram chat id will receive replies.',
     )
-    acp_log_file: str = classyclick.Option(
+    acp_log_file: str | None = classyclick.Option(
         envvar='TELECODEX_ACP_LOG_FILE',
-        default=DEFAULT_ACP_LOG_PATH,
+        default=None,
         type=str,
         show_envvar=True,
-        help='File path to append every ACP/app-server message received.',
+        help='File path to append every ACP/app-server message received (disabled by default).',
     )
     poll_timeout_seconds: int = classyclick.Option(
         envvar='POLL_TIMEOUT_SECONDS',

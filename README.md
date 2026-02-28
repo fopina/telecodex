@@ -36,7 +36,8 @@ Example:
 [telecodex]
 telegram_bot_token = "123456:ABC..."
 allowed_chat_id = 123456789
-acp_log_file = "~/.local/state/telecodex/acp-messages.log"
+# optional: enable ACP message logging
+# acp_log_file = "/path/to/acp-messages.log"
 codex_app_server_cmd = "codex app-server"
 codex_model = "gpt-5"
 codex_cwd = "."
@@ -58,7 +59,7 @@ Option precedence is:
 4. Built-in defaults
 
 `allowed_chat_id` (or `TELEGRAM_ALLOWED_CHAT_ID`) is mandatory, and the bot only replies to that chat id.
-All ACP/app-server messages received on stdout are appended to `acp_log_file`, including messages that are not processed or forwarded to Telegram.
+ACP/app-server message logging is disabled by default and is enabled only when `acp_log_file` (or `TELECODEX_ACP_LOG_FILE`) is set.
 
 ## Run
 
@@ -66,6 +67,16 @@ All ACP/app-server messages received on stdout are appended to `acp_log_file`, i
 # optional: create config.toml at the default platform-specific location shown above
 python3 -m telecodex
 ```
+
+## Telegram commands
+
+On startup, the bot registers Telegram commands:
+
+- `/start`: sends `hello` to Codex to initialize/start the conversation turn
+- `/verbose`: toggles an internal verbose flag (starts `false`)
+- `/status`: shows latest stored ACP rate-limit values (`account/rateLimits/updated`)
+
+When verbose mode is enabled, every ACP/app-server message that is not normally processed by the bridge is sent back to the allowed chat as raw JSON in Markdown.
 
 ## Development
 
