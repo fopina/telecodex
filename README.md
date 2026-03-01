@@ -74,7 +74,8 @@ On startup, the bot registers Telegram commands:
 
 - `/start`: sends `hello` to Codex to initialize/start the conversation turn
 - `/verbose`: toggles an internal verbose flag (starts `false`)
-- `/status`: shows latest stored ACP rate-limit values (`account/rateLimits/updated`)
+- `/status`: fetches current ACP rate-limit values on demand (`account/rateLimits/read`) and shows latest token usage
+- `/model`: shows an inline menu of available models, marks the current one with `✅`, includes `Free text` for manual model ids, and applies the selection to next turns (`Cancel` closes without changes)
 
 When verbose mode is enabled, every ACP/app-server message that is not normally processed by the bridge is sent back to the allowed chat as raw JSON in Markdown.
 
