@@ -20,10 +20,10 @@ from typing import Any
 import classyclick
 import click
 from platformdirs import user_config_dir
-from telegram import BotCommand, Update
+from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction, ParseMode
 from telegram.error import BadRequest
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram.ext import ApplicationBuilder, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
 try:
     import tomllib
@@ -49,6 +49,12 @@ class AskResult:
     unprocessed_messages: list[str]
 
 
+@dataclass(slots=True)
+class ModelOption:
+    model_id: str
+    display_name: str
+
+
 DEFAULT_CONFIG_PATH = str(Path(user_config_dir('telecodex')) / 'config.toml')
 CONFIG_SECTION = 'telecodex'
 CONFIG_KEYS = {
@@ -61,6 +67,7 @@ CONFIG_KEYS = {
     'codex_cwd',
     'codex_approval_policy',
 }
+PENDING_MODEL_INPUT_KEY = 'pending_model_input'
 
 
 def load_settings_from_toml(config_path: str) -> dict[str, Any]:
@@ -231,6 +238,28 @@ class CodexStdioClient:
         with self.rate_limits_lock:
             return copy.deepcopy(self.rate_limits_by_id)
 
+    def read_rate_limits(self) -> dict[Any, dict[str, Any]]:
+        with self.lock:
+            result = self._request('account/rateLimits/read', {})
+
+        by_limit_id = result.get('rateLimitsByLimitId') if isinstance(result, dict) else None
+        normalized: dict[Any, dict[str, Any]] = {}
+        if isinstance(by_limit_id, dict):
+            for key, value in by_limit_id.items():
+                if isinstance(value, dict):
+                    normalized[key] = copy.deepcopy(value)
+        else:
+            single = result.get('rateLimits') if isinstance(result, dict) else None
+            if isinstance(single, dict):
+                normalized[single.get('limitId')] = copy.deepcopy(single)
+
+        if normalized:
+            with self.rate_limits_lock:
+                self.rate_limits_by_id = copy.deepcopy(normalized)
+            return normalized
+
+        return self.get_rate_limits_snapshot()
+
     def _track_token_usage(self, msg: dict[str, Any]) -> None:
         method = msg.get('method')
         if method != 'codex/event/token_count':
@@ -250,6 +279,34 @@ class CodexStdioClient:
     def get_latest_token_usage(self) -> dict[str, Any] | None:
         with self.token_usage_lock:
             return copy.deepcopy(self.latest_token_usage)
+
+    def get_model(self) -> str:
+        with self.lock:
+            return self.model
+
+    def set_model(self, model: str) -> None:
+        with self.lock:
+            self.model = model
+
+    def list_models(self) -> list[ModelOption]:
+        with self.lock:
+            result = self._request('model/list', {})
+
+        data = result.get('data') if isinstance(result, dict) else None
+        if not isinstance(data, list):
+            return []
+
+        models: list[ModelOption] = []
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            raw_model_id = item.get('model') or item.get('id')
+            if not isinstance(raw_model_id, str) or not raw_model_id:
+                continue
+            raw_display_name = item.get('displayName')
+            display_name = raw_display_name if isinstance(raw_display_name, str) and raw_display_name else raw_model_id
+            models.append(ModelOption(model_id=raw_model_id, display_name=display_name))
+        return models
 
     def _request(self, method: str, params: dict, unprocessed_messages: list[str] | None = None) -> dict:
         req_id = self.next_id
@@ -281,6 +338,7 @@ class CodexStdioClient:
                 {
                     'threadId': self.thread_id,
                     'input': [{'type': 'text', 'text': text}],
+                    'model': self.model,
                 },
                 unprocessed_messages=unprocessed_messages,
             )
@@ -291,6 +349,7 @@ class CodexStdioClient:
 
             chunks: list[str] = []
             fallback_final: str | None = None
+            turn_error_message: str | None = None
 
             while True:
                 msg, raw_message = self._read_message()
@@ -307,6 +366,13 @@ class CodexStdioClient:
                         chunks.append(delta)
                     continue
 
+                if method == 'error' and params.get('turnId') == turn_id:
+                    error_message = extract_error_message(params.get('error'))
+                    turn_error_message = error_message
+                    if params.get('willRetry') is False:
+                        raise RuntimeError(error_message)
+                    continue
+
                 if method == 'turn/completed':
                     completed_turn = params.get('turn')
                     completed_turn_id = completed_turn.get('id') if isinstance(completed_turn, dict) else None
@@ -319,6 +385,13 @@ class CodexStdioClient:
                     message = agent_state.get('message') if isinstance(agent_state, dict) else None
                     if isinstance(message, str) and message.strip():
                         fallback_final = message
+                    if completed_turn.get('status') == 'failed':
+                        error_message = extract_error_message(completed_turn.get('error'))
+                        raise RuntimeError(
+                            error_message
+                            if error_message != 'Unknown app-server error'
+                            else turn_error_message or error_message
+                        )
                     break
                 if should_report_verbose_unhandled_message(msg):
                     unprocessed_messages.append(raw_message)
@@ -372,6 +445,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if message.chat_id != allowed_chat_id:
         return
 
+    if context.application.bot_data.get(PENDING_MODEL_INPUT_KEY):
+        codex = context.application.bot_data['codex']
+        assert isinstance(codex, CodexStdioClient)
+        await asyncio.to_thread(codex.set_model, text)
+        context.application.bot_data[PENDING_MODEL_INPUT_KEY] = False
+        await reply_markdown(
+            message,
+            f'Model updated to `{text}` for next turns.',
+            reply_to_message_id=message.message_id,
+        )
+        return
+
     await process_user_input(message, context, text)
 
 
@@ -423,6 +508,25 @@ def should_report_verbose_unhandled_message(msg: dict) -> bool:
     }:
         return False
     return True
+
+
+def extract_error_message(error_payload: Any) -> str:
+    if not isinstance(error_payload, dict):
+        return str(error_payload) if error_payload is not None else 'Unknown app-server error'
+
+    raw_message = error_payload.get('message')
+    if isinstance(raw_message, str) and raw_message.strip():
+        with suppress(json.JSONDecodeError, TypeError):
+            parsed = json.loads(raw_message)
+            detail = parsed.get('detail') if isinstance(parsed, dict) else None
+            if isinstance(detail, str) and detail.strip():
+                return detail
+        return raw_message
+
+    codex_error_info = error_payload.get('codexErrorInfo')
+    if isinstance(codex_error_info, str) and codex_error_info:
+        return codex_error_info
+    return 'Unknown app-server error'
 
 
 async def reply_markdown(message: Any, text: str, reply_to_message_id: int) -> None:
@@ -516,7 +620,7 @@ async def handle_status_command(update: Update, context: ContextTypes.DEFAULT_TY
 
     codex = context.application.bot_data['codex']
     assert isinstance(codex, CodexStdioClient)
-    snapshot = await asyncio.to_thread(codex.get_rate_limits_snapshot)
+    snapshot = await asyncio.to_thread(codex.read_rate_limits)
     token_usage = await asyncio.to_thread(codex.get_latest_token_usage)
     if not snapshot and not token_usage:
         await reply_markdown(
@@ -526,19 +630,28 @@ async def handle_status_command(update: Update, context: ContextTypes.DEFAULT_TY
         )
         return
 
-    lines: list[str] = ['*Status*']
+    lines: list[str] = []
     if snapshot:
-        lines.append('')
-        lines.append('*Rate Limits*')
-        for limit_id, values in sorted(snapshot.items(), key=lambda item: str(item[0])):
-            model = 'Global' if limit_id is None else str(limit_id)
+        sorted_limits = sorted(snapshot.items(), key=lambda item: str(item[0]))
+        visible_limits = [(limit_id, values) for limit_id, values in sorted_limits if should_render_rate_limit(values)]
+        hidden_limit_names = [
+            format_limit_name(limit_id) for limit_id, values in sorted_limits if not should_render_rate_limit(values)
+        ]
+        if visible_limits or hidden_limit_names:
             lines.append('')
-            lines.append(f'*Model:* `{model}`')
+            lines.append('*Rate Limits*')
+            for limit_id, values in visible_limits:
+                model = format_limit_name(limit_id)
+                lines.append('')
+                lines.append(f'*Limit:* `{model}`')
 
-            primary = values.get('primary')
-            secondary = values.get('secondary')
-            lines.append(f'*Primary:* {format_rate_limit_bucket(primary)}')
-            lines.append(f'*Secondary:* {format_rate_limit_bucket(secondary)}')
+                primary = values.get('primary')
+                secondary = values.get('secondary')
+                lines.append(f'*Primary:* {format_rate_limit_bucket(primary)}')
+                lines.append(f'*Secondary:* {format_rate_limit_bucket(secondary)}')
+            if hidden_limit_names:
+                lines.append('')
+                lines.append(f'*Unused limits:* `{", ".join(hidden_limit_names)}`')
 
     if token_usage:
         lines.append('')
@@ -563,6 +676,20 @@ def format_rate_limit_bucket(bucket: Any) -> str:
     return f'{used_percent_display} - {reset_display}'
 
 
+def should_render_rate_limit(values: Any) -> bool:
+    if not isinstance(values, dict):
+        return True
+    primary = values.get('primary')
+    secondary = values.get('secondary')
+    primary_used = primary.get('usedPercent') if isinstance(primary, dict) else None
+    secondary_used = secondary.get('usedPercent') if isinstance(secondary, dict) else None
+    return not (primary_used == 0 and secondary_used == 0)
+
+
+def format_limit_name(limit_id: Any) -> str:
+    return 'Global' if limit_id is None else str(limit_id)
+
+
 def format_token_usage(usage: Any) -> str:
     if not isinstance(usage, dict):
         return 'n/a'
@@ -579,18 +706,121 @@ def format_utc_timestamp(value: Any) -> str:
     return dt.strftime('%Y-%m-%d %H:%M:%S UTC')
 
 
+def build_model_menu(models: list[ModelOption], selected_model: str) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for model in models:
+        marker = '✅ ' if model.model_id == selected_model else ''
+        label = f'{marker}{model.display_name}'
+        rows.append([InlineKeyboardButton(text=label, callback_data=f'model:set:{model.model_id}')])
+    rows.append([InlineKeyboardButton(text='Free text', callback_data='model:free_text')])
+    rows.append([InlineKeyboardButton(text='Cancel', callback_data='model:cancel')])
+    return InlineKeyboardMarkup(rows)
+
+
 async def setup_bot_commands(application: Any) -> None:
     await application.bot.set_my_commands(
         [
             BotCommand(command='start', description='Start conversation with Codex'),
             BotCommand(command='verbose', description='Toggle verbose ACP debug messages'),
             BotCommand(command='status', description='Show latest ACP rate-limit updates'),
+            BotCommand(command='model', description='Choose the Codex model'),
         ]
     )
 
 
 async def handle_error(_: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     print(f'Loop error: {context.error}', file=sys.stderr)
+
+
+async def handle_model_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    if message is None:
+        return
+    allowed_chat_id = context.application.bot_data.get('allowed_chat_id')
+    if message.chat_id != allowed_chat_id:
+        return
+
+    codex = context.application.bot_data['codex']
+    assert isinstance(codex, CodexStdioClient)
+
+    try:
+        models = await asyncio.to_thread(codex.list_models)
+        selected_model = await asyncio.to_thread(codex.get_model)
+    except Exception as exc:  # noqa: BLE001
+        await reply_markdown(message, f'app-server error: {exc}', reply_to_message_id=message.message_id)
+        return
+
+    if not models:
+        await reply_markdown(message, 'No models available from app-server.', reply_to_message_id=message.message_id)
+        return
+
+    keyboard = build_model_menu(models, selected_model=selected_model)
+    await message.reply_text(
+        f'Select model for next turns (current: `{selected_model}`):',
+        reply_to_message_id=message.message_id,
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=keyboard,
+        disable_web_page_preview=True,
+    )
+
+
+async def handle_model_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if query is None:
+        return
+
+    message = query.message
+    if message is None:
+        await query.answer()
+        return
+
+    allowed_chat_id = context.application.bot_data.get('allowed_chat_id')
+    if message.chat_id != allowed_chat_id:
+        await query.answer()
+        return
+
+    data = query.data or ''
+    if data == 'model:cancel':
+        context.application.bot_data[PENDING_MODEL_INPUT_KEY] = False
+        await query.answer('Canceled')
+        await query.edit_message_reply_markup(reply_markup=None)
+        return
+
+    if data == 'model:free_text':
+        context.application.bot_data[PENDING_MODEL_INPUT_KEY] = True
+        await query.answer()
+        await query.edit_message_text('Send the model id as a text message. It will be used for next turns.')
+        return
+
+    if not data.startswith('model:set:'):
+        await query.answer()
+        return
+
+    model_id = data.removeprefix('model:set:')
+    codex = context.application.bot_data['codex']
+    assert isinstance(codex, CodexStdioClient)
+
+    try:
+        models = await asyncio.to_thread(codex.list_models)
+    except Exception as exc:  # noqa: BLE001
+        await query.answer('Failed to load models')
+        await query.edit_message_text(f'Could not load models: {exc}')
+        return
+
+    available_ids = {model.model_id for model in models}
+    if model_id not in available_ids:
+        await query.answer('Model unavailable')
+        selected_model = await asyncio.to_thread(codex.get_model)
+        await query.edit_message_text(
+            f'Model `{model_id}` is not available. Current model remains `{selected_model}`.',
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    await asyncio.to_thread(codex.set_model, model_id)
+    context.application.bot_data[PENDING_MODEL_INPUT_KEY] = False
+    await query.answer(f'Model set to {model_id}')
+    await query.edit_message_text(f'Model updated to `{model_id}` for next turns.', parse_mode=ParseMode.MARKDOWN)
 
 
 def run_bot(settings: Settings) -> None:
@@ -610,15 +840,18 @@ def run_bot(settings: Settings) -> None:
             app.bot_data['codex'] = codex
             app.bot_data['allowed_chat_id'] = settings.allowed_chat_id
             app.bot_data['verbose'] = False
+            app.bot_data[PENDING_MODEL_INPUT_KEY] = False
             app.add_handler(CommandHandler('start', handle_start_command))
             app.add_handler(CommandHandler('verbose', handle_verbose_command))
             app.add_handler(CommandHandler('status', handle_status_command))
+            app.add_handler(CommandHandler('model', handle_model_command))
+            app.add_handler(CallbackQueryHandler(handle_model_callback, pattern=r'^model:(set:|free_text$|cancel$)'))
             app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
             app.add_error_handler(handle_error)
 
             print('Bot is running (Telegram <-> codex app-server over stdio).')
             app.run_polling(
-                allowed_updates=['message'],
+                allowed_updates=['message', 'callback_query'],
                 timeout=settings.poll_timeout_seconds,
                 close_loop=False,
             )
